@@ -1,0 +1,354 @@
+openapi: 3.1.0
+info:
+  title: Pokémon League API
+  version: 1.0.0
+  description: |
+    Trainers register for capacity-limited tournaments hosted by gym leaders.
+
+    * Auth: short-lived Ed25519 JWT access tokens (15 min) + rotating opaque refresh tokens.
+    * Roles: `trainer`, `gym_leader`, `admin`.
+    * Errors: every non-2xx response is `application/problem+json` (RFC 9457) with a stable `code`.
+servers:
+  - url: http://localhost:8080
+security:
+  - bearer: []
+
+paths:
+  /:
+    get:
+      summary: Service index (lists the available routes)
+      security: []
+      responses:
+        "200": { description: OK }
+  /healthz:
+    get:
+      summary: Liveness probe (process is up)
+      security: []
+      responses:
+        "200": { description: OK }
+  /readyz:
+    get:
+      summary: Readiness probe (database reachable, not draining)
+      security: []
+      responses:
+        "200": { description: Ready }
+        "503": { $ref: "#/components/responses/Problem" }
+
+  /v1/auth/signup:
+    post:
+      summary: Create a trainer account (role `trainer`)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, email, password]
+              properties:
+                username: { type: string, pattern: "^[A-Za-z0-9_]{3,32}$", example: ash }
+                email: { type: string, format: email, example: ash@pallet.town }
+                password: { type: string, minLength: 12, maxLength: 128 }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Trainer" } } } }
+        "409": { $ref: "#/components/responses/Problem" }
+        "422": { $ref: "#/components/responses/Problem" }
+        "429": { $ref: "#/components/responses/Problem" }
+  /v1/auth/login:
+    post:
+      summary: Exchange credentials for a token pair (starts a new session)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/TokenPair" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+        "429": { $ref: "#/components/responses/Problem" }
+  /v1/auth/refresh:
+    post:
+      summary: Rotate a refresh token
+      description: |
+        Each refresh token is single-use. Presenting one that was already used returns
+        `401 refresh_token_reused` and revokes every token of that session.
+      security: []
+      requestBody: { $ref: "#/components/requestBodies/RefreshToken" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/TokenPair" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+        "429": { $ref: "#/components/responses/Problem" }
+  /v1/auth/logout:
+    post:
+      summary: Revoke the session of a refresh token (idempotent)
+      security: []
+      requestBody: { $ref: "#/components/requestBodies/RefreshToken" }
+      responses:
+        "204": { description: Logged out }
+
+  /v1/me:
+    get:
+      summary: The authenticated trainer
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Trainer" } } } }
+        "401": { $ref: "#/components/responses/Problem" }
+  /v1/me/registrations:
+    get:
+      summary: Tournaments I am registered for (newest first)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+
+  /v1/tournaments:
+    get:
+      summary: List tournaments (filter, sort, keyset pagination)
+      parameters:
+        - { name: region, in: query, schema: { $ref: "#/components/schemas/Region" } }
+        - { name: type, in: query, schema: { $ref: "#/components/schemas/PokemonType" } }
+        - { name: status, in: query, schema: { $ref: "#/components/schemas/Status" } }
+        - { name: host_id, in: query, schema: { type: string, format: uuid } }
+        - { name: has_spots, in: query, schema: { type: boolean } }
+        - { name: starts_after, in: query, description: "Inclusive, RFC 3339", schema: { type: string, format: date-time } }
+        - { name: starts_before, in: query, description: "Exclusive, RFC 3339", schema: { type: string, format: date-time } }
+        - name: sort
+          in: query
+          description: Prefix with `-` for descending. The id is always the tiebreaker.
+          schema: { type: string, enum: [starts_at, -starts_at, created_at, -created_at, name, -name], default: starts_at }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - name: cursor
+          in: query
+          description: Opaque `page.next_cursor` from the previous page. Must be used with the same `sort`.
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Tournament" } }
+                  page:
+                    type: object
+                    properties:
+                      next_cursor: { type: [string, "null"] }
+                      limit: { type: integer }
+        "401": { $ref: "#/components/responses/Problem" }
+        "422": { $ref: "#/components/responses/Problem" }
+    post:
+      summary: Create a tournament (gym_leader, admin). The caller becomes the host.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name, region, type, capacity, starts_at]
+              properties:
+                name: { type: string, minLength: 3, maxLength: 100 }
+                description: { type: string, maxLength: 2000 }
+                region: { $ref: "#/components/schemas/Region" }
+                type: { $ref: "#/components/schemas/PokemonType" }
+                capacity: { type: integer, minimum: 2, maximum: 1024 }
+                starts_at: { type: string, format: date-time }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/Tournament" } } } }
+        "403": { $ref: "#/components/responses/Problem" }
+        "422": { $ref: "#/components/responses/Problem" }
+
+  /v1/tournaments/{id}:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    get:
+      summary: Get a tournament
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Tournament" } } } }
+        "404": { $ref: "#/components/responses/Problem" }
+    patch:
+      summary: Update a tournament (its host, or an admin)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                name: { type: string }
+                description: { type: string }
+                capacity: { type: integer, description: "Cannot go below registered_count" }
+                status: { $ref: "#/components/schemas/Status" }
+                starts_at: { type: string, format: date-time }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Tournament" } } } }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+
+  /v1/tournaments/{id}/registrations:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    post:
+      summary: Register yourself (trainer, gym_leader)
+      description: |
+        Concurrency-safe: the tournament row is locked for the duration of the
+        transaction, so concurrent requests can never exceed `capacity`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [lead_pokemon]
+              properties:
+                lead_pokemon: { type: string, minLength: 1, maxLength: 40, example: Pikachu }
+      responses:
+        "201": { description: Registered, content: { application/json: { schema: { $ref: "#/components/schemas/Registration" } } } }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409":
+          description: "`tournament_full`, `already_registered`, `registration_closed` or `host_cannot_register`"
+          content: { application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } } }
+        "503": { $ref: "#/components/responses/Problem" }
+    get:
+      summary: Roster of a tournament (its host, or an admin)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: "#/components/schemas/Registration" } }
+        "403": { $ref: "#/components/responses/Problem" }
+  /v1/tournaments/{id}/registrations/me:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    delete:
+      summary: Withdraw from a tournament (frees the spot)
+      responses:
+        "204": { description: Withdrawn }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+
+  /v1/admin/trainers/{id}/role:
+    parameters: [{ $ref: "#/components/parameters/Id" }]
+    put:
+      summary: Set a trainer's role (admin). Revokes their refresh tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [role]
+              properties:
+                role: { $ref: "#/components/schemas/Role" }
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Trainer" } } } }
+        "403": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409": { $ref: "#/components/responses/Problem" }
+
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    Id: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+  requestBodies:
+    RefreshToken:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [refresh_token]
+            properties:
+              refresh_token: { type: string }
+  responses:
+    Problem:
+      description: Error (RFC 9457 problem details)
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, example: "urn:pokeleague:problem:tournament_full" }
+        title: { type: string, example: Conflict }
+        status: { type: integer, example: 409 }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string, example: tournament_full }
+        request_id: { type: string }
+        errors: { type: object, additionalProperties: { type: string }, description: Per-field validation messages }
+    Role: { type: string, enum: [trainer, gym_leader, admin] }
+    Status: { type: string, enum: [open, closed, cancelled] }
+    Region: { type: string, enum: [kanto, johto, hoenn, sinnoh, unova, kalos, alola, galar, paldea] }
+    PokemonType:
+      type: string
+      enum: [normal, fire, water, grass, electric, ice, fighting, poison, ground, flying, psychic, bug, rock, ghost, dragon, dark, steel, fairy]
+    UserRef:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+    Trainer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        username: { type: string }
+        email: { type: string }
+        role: { $ref: "#/components/schemas/Role" }
+        created_at: { type: string, format: date-time }
+    Tournament:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        description: { type: string }
+        region: { $ref: "#/components/schemas/Region" }
+        type: { $ref: "#/components/schemas/PokemonType" }
+        host: { $ref: "#/components/schemas/UserRef" }
+        capacity: { type: integer }
+        registered_count: { type: integer }
+        spots_left: { type: integer }
+        status: { $ref: "#/components/schemas/Status" }
+        starts_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Registration:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tournament_id: { type: string, format: uuid }
+        tournament_name: { type: string }
+        trainer: { $ref: "#/components/schemas/UserRef" }
+        lead_pokemon: { type: string }
+        created_at: { type: string, format: date-time }
+    TokenPair:
+      type: object
+      properties:
+        access_token: { type: string }
+        token_type: { type: string, const: Bearer }
+        expires_in: { type: integer, description: Access token lifetime in seconds }
+        refresh_token: { type: string }
+        refresh_expires_at: { type: string, format: date-time }

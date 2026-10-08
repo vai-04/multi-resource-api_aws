@@ -1,0 +1,37 @@
+# Local development stack: Postgres + the API.
+#   docker compose up --build
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pokeleague
+      POSTGRES_PASSWORD: pokeleague
+      POSTGRES_DB: pokeleague
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pokeleague -d pokeleague"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://pokeleague:pokeleague@db:5432/pokeleague?sslmode=disable
+      # Development-only demo admin. In production, create admins out of band.
+      BOOTSTRAP_ADMIN_USERNAME: professor_oak
+      BOOTSTRAP_ADMIN_EMAIL: oak@pallet.town
+      BOOTSTRAP_ADMIN_PASSWORD: gotta-catch-em-all-151
+      LOG_LEVEL: info
+
+volumes:
+  pgdata:
